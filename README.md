@@ -6,10 +6,10 @@ Table of contents
 Setup & config
 1. ETL: backfill top pools (GraphQL + Python)
 2. Building hourly pool_snapshot (DuckDB/Parquet)
-Enrichment: token prices, exchange inflows
-Baseline dashboard (Streamlit) — Sankey + heatmap
-Forecasting: baseline LightGBM and TCN skeleton
-Causality: Granger, Transfer Entropy, DoWhy example
-Shock simulator (deterministic + causal-adjusted)
-QA, tests, and monitoring
-Next steps & where to run things
+3. Enrichment: token prices, exchange inflows
+4. Baseline dashboard (Streamlit) — Sankey + heatmap
+5. Forecasting: baseline LightGBM and TCN skeleton
+6. Causality: Granger, Transfer Entropy, DoWhy example
+7. Shock simulator (deterministic + causal-adjusted)
+8. QA, tests, and monitoring
+9. Next steps & where to run things
