@@ -4,8 +4,8 @@ It's organized by phase: ETL/backfill, storage & OLAP, baseline dashboard, forec
 
 Table of contents
 Setup & config
-ETL: backfill top pools (GraphQL + Python)
-Building hourly pool_snapshot (DuckDB/Parquet)
+1. ETL: backfill top pools (GraphQL + Python)
+2. Building hourly pool_snapshot (DuckDB/Parquet)
 Enrichment: token prices, exchange inflows
 Baseline dashboard (Streamlit) — Sankey + heatmap
 Forecasting: baseline LightGBM and TCN skeleton
