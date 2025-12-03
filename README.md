@@ -1,15 +1,17 @@
-# DeFi-Liquidity-Risk-Dashboard
-This document expands the previous plan into concrete, runnable steps with code snippets, GraphQL queries, SQL/duckDB examples, model skeletons, causal-analysis code, and a minimal Streamlit app.
-It's organized by phase: ETL/backfill, storage & OLAP, baseline dashboard, forecasting models, causal analysis & shock simulator, and deployment/tests. Use this as a recipe — copy the code into your repo and adapt endpoints/keys.
+This README.md outlines the goals, features, data requirements, and technical specifications for the DeFi Liquidity & Risk Dashboard project, based on the provided implementation plan.
 
-Table of contents
-Setup & config
-1. ETL: backfill top pools (GraphQL + Python)
-2. Building hourly pool_snapshot (DuckDB/Parquet)
-3. Enrichment: token prices, exchange inflows
-4. Baseline dashboard (Streamlit) — Sankey + heatmap
-5. Forecasting: baseline LightGBM and TCN skeleton
-6. Causality: Granger, Transfer Entropy, DoWhy example
-7. Shock simulator (deterministic + causal-adjusted)
-8. QA, tests, and monitoring
-9. Next steps & where to run things
+1. Introduction and Project Goal
+Title:
+DeFi Liquidity & Risk Dashboard (MVP)
+
+Project Goal
+To build a robust data pipeline and analytical dashboard capable of tracking historical liquidity, forecasting key metrics, and simulating systemic shock propagation across decentralized finance (DeFi) liquidity pools.
+
+Target Users
+DeFi analysts, quantitative traders, risk managers, and protocol treasuries.
+
+Objectives
+Establish a reliable ETL pipeline to backfill high-fidelity historical pool state data.
+Develop a baseline dashboard for liquidity flow visualization and immediate risk monitoring.
+Implement time-series forecasting models for liquidity prediction.
+Build a causal analysis framework and a shock simulator to model systemic risk.
