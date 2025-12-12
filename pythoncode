@@ -1,10 +1,324 @@
 # @title 1. Install Dependencies
-# Install system libraries for some causal packages
-!apt-get install -y libgmp-dev libmpfr-dev libmpc-dev
+# Install system libraries for causal packages
+!apt-get install -y libgmp-dev libmpfr-dev libmpc-dev > /dev/null
 
 # Install Python packages
-!pip install -q requests gql pandas duckdb pyarrow aiohttp sqlalchemy streamlit plotly clickhouse-connect tqdm python-dotenv
+!pip install -q dune-client pandas duckdb pyarrow streamlit plotly clickhouse-connect tqdm python-dotenv
 !pip install -q lightgbm torch torchvision torchaudio scikit-learn statsmodels dowhy pyinform pyngrok darts
 
-print("✅ Dependencies installed.")
+print("✅ All dependencies installed.")
 
+
+
+# @title 2. Setup Configuration
+import os
+from pathlib import Path
+
+# --- CONFIGURATION ---
+DUNE_API_KEY = "Ix7lU04y5D2lGSDSfDDTZoEtQi1VU67k" # <--- PASTE YOUR DUNE KEY HERE
+
+# Create data directory
+DATA_DIR = Path('/content/data')
+DATA_DIR.mkdir(exist_ok=True)
+
+if DUNE_API_KEY == "YOUR_DUNE_KEY":
+    print("⚠️ WARNING: You must enter a valid Dune API Key above!")
+else:
+    print(f"✅ Configured with Dune API. Data dir: {DATA_DIR}")
+
+
+
+
+
+
+
+
+
+from dune_client.client import DuneClient
+from dune_client.query import QueryBase
+import pandas as pd
+import io
+
+# 1. Initialize Dune Client
+dune = DuneClient(DUNE_API_KEY)
+
+# 2. Define SQL Query
+# We fetch the last 60 days of Swaps for the USDC-ETH 0.05% Pool.
+# Address: 0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640
+# We aggregate to Hourly stats directly in SQL to save bandwidth.
+
+SQL_QUERY = """
+WITH raw_swaps AS (
+    SELECT
+        date_trunc('hour', evt_block_time) as hour,
+        avg(liquidity) as avg_liquidity, -- Active liquidity in the current tick
+        avg(sqrtPriceX96) as avg_sqrtPrice,
+        sum(abs(amount0)) / 1e6 as vol_usdc, -- USDC has 6 decimals
+        sum(abs(amount1)) / 1e18 as vol_eth  -- ETH has 18 decimals
+    FROM uniswap_v3_ethereum.UniswapV3Pool_evt_Swap
+    WHERE contract_address = 0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640
+    AND evt_block_time > now() - interval '60' day
+    GROUP BY 1
+)
+SELECT
+    hour,
+    avg_liquidity,
+    avg_sqrtPrice,
+    vol_usdc,
+    vol_eth
+FROM raw_swaps
+ORDER BY hour ASC
+"""
+
+def fetch_dune_data():
+    print("⏳ Submitting query to Dune (this takes ~30-60s)...")
+    try:
+        # Execute raw SQL
+        query_result = dune.run_sql(query_sql=SQL_QUERY)
+
+        # Convert to Pandas
+        data = query_result.result.rows
+        df = pd.DataFrame(data)
+
+        # Clean timestamps
+        df['hour'] = pd.to_datetime(df['hour']).dt.tz_localize(None)
+
+        # Convert numeric types (Dune returns strings sometimes)
+        cols = ['avg_liquidity', 'avg_sqrtPrice', 'vol_usdc', 'vol_eth']
+        for c in cols:
+            df[c] = pd.to_numeric(df[c])
+
+        save_path = DATA_DIR / "dune_pool_data.parquet"
+        df.to_parquet(save_path)
+        print(f"✅ Fetched {len(df)} rows. Saved to {save_path}")
+        return df
+
+    except Exception as e:
+        print(f"❌ Dune Error: {e}")
+        return pd.DataFrame()
+
+df_raw = fetch_dune_data()
+df_raw.head()
+
+
+
+
+# @title 4. Data Enrichment with DuckDB
+import duckdb
+import numpy as np
+
+# Connect to in-memory DB
+con = duckdb.connect(database=':memory:')
+
+# Uniswap V3 Price Math: Price = (sqrtPrice / 2^96)^2
+# For USDC/ETH, we adjust for decimals (10^12 difference).
+con.execute(f"CREATE OR REPLACE VIEW dune_raw AS SELECT * FROM '{DATA_DIR}/dune_pool_data.parquet'")
+
+sql_analytics = """
+CREATE OR REPLACE TABLE pool_analytics AS
+SELECT
+    hour as date,
+    
+    -- 1. Calculate Price (USDC per ETH)
+    -- Price = (sqrtPriceX96 / Q96)^2 * (10^12 decimal adj)
+    POWER((avg_sqrtPrice / 79228162514264337593543950336), 2) * 1e12 as eth_price,
+    
+    -- 2. Liquidity Depth (Raw Value)
+    avg_liquidity as active_liquidity,
+    
+    -- 3. Volume (Sum of both sides in USD approx)
+    vol_usdc + (vol_eth * POWER((avg_sqrtPrice / 79228162514264337593543950336), 2) * 1e12) as volume_usd,
+
+    -- 4. Volatility (Std Dev of Price over 24h)
+    STDDEV(avg_sqrtPrice) OVER (ORDER BY hour ROWS BETWEEN 24 PRECEDING AND CURRENT ROW) as volatility_24h
+
+FROM dune_raw
+ORDER BY date ASC;
+"""
+
+con.execute(sql_analytics)
+df_analytics = con.execute("SELECT * FROM pool_analytics").df()
+
+# Fill NaNs (early periods might have missing vol)
+df_analytics = df_analytics.fillna(method='bfill')
+
+df_analytics.to_parquet(DATA_DIR / "pool_analytics.parquet")
+print("✅ Analytics calculated. Sample:")
+print(df_analytics.tail())
+
+
+
+
+
+# @title 5. Train Forecast Model
+import lightgbm as lgb
+from sklearn.metrics import mean_absolute_percentage_error
+
+# 1. Prepare Dataset
+data = df_analytics.copy()
+target = 'active_liquidity'
+
+# Lag Features
+for lag in [1, 12, 24]:
+    data[f'liq_lag_{lag}'] = data[target].shift(lag)
+    data[f'price_lag_{lag}'] = data['eth_price'].shift(lag)
+
+# Target: Liquidity 24h in future
+data['target_future'] = data[target].shift(-24)
+data = data.dropna()
+
+# Split
+split = int(len(data) * 0.8)
+train = data.iloc[:split]
+test = data.iloc[split:]
+
+features = [c for c in data.columns if 'lag' in c or c in ['volatility_24h', 'volume_usd']]
+X_train, y_train = train[features], train['target_future']
+X_test, y_test = test[features], test['target_future']
+
+# 2. Train
+print("🧠 Training LightGBM...")
+model = lgb.LGBMRegressor(n_estimators=100)
+model.fit(X_train, y_train)
+
+# 3. Predict
+preds = model.predict(X_test)
+mape = mean_absolute_percentage_error(y_test, preds)
+print(f"📉 Forecast MAPE: {mape:.2%}")
+
+# Save for Dashboard
+test['forecast'] = preds
+test.to_parquet(DATA_DIR / "forecast_results.parquet")
+
+
+
+
+# @title 6. Causal Inference (DoWhy)
+from dowhy import CausalModel
+
+# Treatment: High Volatility (Binary > 75th percentile)
+# Outcome: Change in Liquidity next hour
+# Confounder: Volume (Demand)
+
+causal_df = df_analytics.copy()
+vol_thresh = causal_df['volatility_24h'].quantile(0.75)
+
+causal_df['high_volatility'] = (causal_df['volatility_24h'] > vol_thresh).astype(int)
+causal_df['liquidity_change'] = causal_df['active_liquidity'].pct_change().shift(-1) # Next hour change
+causal_df = causal_df.dropna()
+
+# 1. Define Graph
+model_dowhy = CausalModel(
+    data=causal_df,
+    treatment='high_volatility',
+    outcome='liquidity_change',
+    common_causes=['volume_usd', 'eth_price']
+)
+
+# 2. Estimate
+identified_estimand = model_dowhy.identify_effect()
+estimate = model_dowhy.estimate_effect(
+    identified_estimand,
+    method_name="backdoor.linear_regression"
+)
+
+print(f"🔍 Causal Beta: {estimate.value}")
+print("Meaning: When volatility spikes, liquidity changes by this % (on average).")
+
+# Save for Dashboard
+with open(DATA_DIR / "causal_beta.txt", "w") as f:
+    f.write(str(estimate.value))
+
+
+
+
+
+# @title 7. Generate Dashboard Code
+%%writefile app.py
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from pathlib import Path
+
+st.set_page_config(layout="wide", page_title="Dune Liquidity Risk")
+DATA_DIR = Path('/content/data')
+
+@st.cache_data
+def load_data():
+    analytics = pd.read_parquet(DATA_DIR / 'pool_analytics.parquet')
+    forecast = pd.read_parquet(DATA_DIR / 'forecast_results.parquet')
+    try:
+        with open(DATA_DIR / 'causal_beta.txt', 'r') as f:
+            beta = float(f.read())
+    except: beta = -0.01
+    return analytics, forecast, beta
+
+df, df_pred, beta = load_data()
+
+st.title("🛡️ DeFi Liquidity Risk (Powered by Dune)")
+
+# Top Metrics
+curr_liq = df['active_liquidity'].iloc[-1]
+curr_price = df['eth_price'].iloc[-1]
+col1, col2, col3 = st.columns(3)
+col1.metric("ETH Price", f"${curr_price:,.2f}")
+col2.metric("Active Liquidity (Virtual)", f"{curr_liq:,.0f}")
+col3.metric("Volatility Sensitivity", f"{beta:.5f}")
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["Market Data", "AI Forecast", "Shock Simulator"])
+
+with tab1:
+    st.subheader("Price vs Liquidity")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['date'], y=df['eth_price'], name='Price'))
+    fig.add_trace(go.Scatter(x=df['date'], y=df['active_liquidity'], name='Liquidity', yaxis='y2'))
+    fig.update_layout(yaxis2=dict(overlaying='y', side='right'))
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    st.subheader("Liquidity Forecast (24h)")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=df_pred['date'], y=df_pred['active_liquidity'], name='Actual'))
+    fig2.add_trace(go.Scatter(x=df_pred['date'], y=df_pred['forecast'], name='AI Forecast', line=dict(dash='dot', color='red')))
+    st.plotly_chart(fig2, use_container_width=True)
+
+with tab3:
+    st.subheader("Scenario Analysis")
+    shock = st.slider("Simulate Volatility Spike", 0, 100, 20)
+    
+    # Simple Linear Causal Simulation
+    # Impact = Shock * Beta * Current Liquidity
+    impact = (shock / 100) * beta * curr_liq
+    new_liq = curr_liq + impact
+    
+    c1, c2 = st.columns(2)
+    c1.error(f"Est. Liquidity Flight: {impact:,.0f}")
+    c2.metric("Remaining Liquidity", f"{new_liq:,.0f}")
+
+
+
+
+
+
+# @title 8. Launch via Ngrok
+from pyngrok import ngrok
+import time
+
+# 1. Kill old processes
+!pkill -9 streamlit
+
+# 2. Auth
+NGROK_TOKEN = input("Enter ngrok Authtoken: ")
+ngrok.set_auth_token(NGROK_TOKEN)
+
+# 3. Run
+get_ipython().system_raw('streamlit run app.py &')
+time.sleep(3)
+
+# 4. Tunnel
+try:
+    url = ngrok.connect(8501).public_url
+    print(f"🚀 DASHBOARD LIVE: {url}")
+except Exception as e:
+    print(f"Error: {e}")
