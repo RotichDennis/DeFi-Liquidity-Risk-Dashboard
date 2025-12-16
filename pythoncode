@@ -232,7 +232,6 @@ with open(DATA_DIR / "causal_beta.txt", "w") as f:
 
 
 
-
 # @title 7. Generate Dashboard Code
 %%writefile app.py
 import streamlit as st
